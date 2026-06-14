@@ -2,14 +2,13 @@ package urlscan
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes urlscan as a kit Domain: a driver that a multi-domain
+// domain.go exposes urlscan.io as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/urlscan-cli/urlscan"
@@ -19,12 +18,9 @@ import (
 // urlscan:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone urlscan binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the urlscan driver. It carries no state; the per-run client is
+// Domain is the urlscan.io driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
@@ -36,40 +32,34 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "urlscan",
-			Short:  "A command line for urlscan.",
-			Long: `A command line for urlscan.
+			Short:  "Read public urlscan.io scan data",
+			Long: `A command line for urlscan.io.
 
-urlscan reads public urlscan data over plain HTTPS, shapes it into
+urlscan reads public scan data from urlscan.io over HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+key required for search and result lookups.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/urlscan-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `urlscan page` and
-	// `ant get urlscan://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// search: query urlscan.io for matching scans.
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search urlscan.io scans",
+		Args:    []kit.Arg{{Name: "query", Help: "search query e.g. 'domain:github.com' or 'page.ip:8.8.8.8'"}}}, doSearch)
 
-	// List op: members of a page, the home of `urlscan links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// urlscan://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// result: fetch the full detail for a single scan by UUID.
+	kit.Handle(app, kit.OpMeta{Name: "result", Group: "read", Single: true,
+		Summary: "Fetch a scan result by UUID", URIType: "uuid", Resolver: true,
+		Args: []kit.Arg{{Name: "uuid", Help: "scan UUID"}}}, doResult)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,86 +78,104 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg" help:"search query e.g. 'domain:github.com' or 'page.ip:8.8.8.8'"`
+	Size   int     `kit:"flag,inherit" help:"max results" default:"10"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type resultInput struct {
+	UUID   string  `kit:"arg" help:"scan UUID"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func doSearch(ctx context.Context, in searchInput, emit func(*ScanResult) error) error {
+	results, err := in.Client.Search(ctx, in.Query, in.Size)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, r := range results {
+		if err := emit(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func doResult(ctx context.Context, in resultInput, emit func(*ScanDetail) error) error {
+	detail, err := in.Client.Result(ctx, in.UUID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(detail)
+}
+
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full urlscan.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
+// A 36-char UUID-like string (with hyphens) maps to "uuid"; a URL maps to "url";
+// everything else is treated as a search query.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized urlscan reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty urlscan reference")
 	}
-	return "page", id, nil
+	if isUUID(input) {
+		return "uuid", input, nil
+	}
+	if isURL(input) {
+		return "url", input, nil
+	}
+	return "query", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "uuid":
+		return "https://" + Host + "/result/" + id + "/", nil
+	case "url":
+		return "https://" + Host + "/search/#page.url:" + id, nil
+	case "query":
+		return "https://" + Host + "/search/#" + id, nil
+	default:
 		return "", errs.Usage("urlscan has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// isUUID returns true if s looks like a standard 36-character UUID
+// (8-4-4-4-12 hex groups separated by hyphens).
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
 	}
-	return strings.Trim(input, "/")
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isURL returns true if s looks like an http/https URL.
+func isURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
