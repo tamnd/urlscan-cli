@@ -1,0 +1,10 @@
+title       = "urlscan"
+baseURL     = "https://urlscan-cli.tamnd.com/"
+description = "A command line for urlscan."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/urlscan-cli"
